@@ -1,0 +1,30 @@
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerStorage = game:GetService("ServerStorage")
+
+local getPlotInfo = ReplicatedStorage.Events:WaitForChild("GetPlotInfo")
+
+getPlotInfo.OnServerInvoke = function(player)
+	local info = ServerStorage:WaitForChild("Info"):WaitForChild("Plots")
+	for _, plotValue in pairs(info:GetChildren()) do
+		if plotValue:IsA("StringValue") and plotValue.Value == tostring(player.UserId) then
+			local plotContainer = workspace:FindFirstChild("Slots")
+			local plotInstance = plotContainer and plotContainer:FindFirstChild(plotValue.Name)
+			if plotInstance then
+				local basePart = plotInstance:FindFirstChild("Base")
+				if not basePart and plotInstance.Name == "Base" then
+					basePart = plotInstance
+				end
+				if basePart then
+					local minCorner = basePart.Position - (basePart.Size / 2)
+					return {
+						minCorner = minCorner,
+						size = basePart.Size,
+						plotName = plotInstance.Name,
+						basePartName = basePart.Name
+					}
+				end
+			end
+		end
+	end
+	return nil
+end
