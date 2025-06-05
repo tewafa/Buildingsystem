@@ -1,0 +1,74 @@
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerStorage = game:GetService("ServerStorage")
+local placeBlockEvent = ReplicatedStorage.Events:WaitForChild("PlaceBlockEvent")
+
+local BLOCK_SIZE = 3
+local MAX_BUILD_RADIUS = 15
+local templatesFolder = ServerStorage:WaitForChild("BuildingTemplates")
+
+local function getPlayerPlotAndBase(player)
+	local info = ServerStorage:WaitForChild("Info"):WaitForChild("Plots")
+	for _, plotValue in pairs(info:GetChildren()) do
+		if plotValue:IsA("StringValue") and plotValue.Value == tostring(player.UserId) then
+			local plotContainer = workspace:FindFirstChild("Slots")
+			local plotInstance = plotContainer and plotContainer:FindFirstChild(plotValue.Name)
+			if plotInstance then
+				local basePart = plotInstance:FindFirstChild("Base")
+				if not basePart and plotInstance.Name == "Base" then
+					basePart = plotInstance
+				end
+				if basePart then
+					return plotInstance, basePart
+				end
+			end
+		end
+	end
+	return nil, nil
+end
+
+local function isPointInBasePlot(pos, basePart)
+	local min = basePart.Position - (basePart.Size / 2)
+	local max = basePart.Position + (basePart.Size / 2)
+	return
+		pos.X >= min.X and pos.X <= max.X and
+		pos.Z >= min.Z and pos.Z <= max.Z
+end
+
+placeBlockEvent.OnServerEvent:Connect(function(player, templateName, position, yRot, xRot)
+	local character = player.Character
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	if root and (position - root.Position).Magnitude > MAX_BUILD_RADIUS then
+		warn("Player tried to build outside allowed radius!")
+		return
+	end
+
+	local plotInstance, basePart = getPlayerPlotAndBase(player)
+	if not plotInstance or not basePart then
+		warn("Player does not own a plot, or plot is missing base part!")
+		return
+	end
+
+	if not isPointInBasePlot(position, basePart) then
+		warn(player.Name .. " tried to build outside their plot!")
+		return
+	end
+
+	local templatesFolder = ServerStorage:WaitForChild("BuildingTemplates")
+	local template = templatesFolder:FindFirstChild(templateName)
+	if not template then
+		warn("No template named '" .. tostring(templateName) .. "' in ServerStorage.BuildingTemplates!")
+		return
+	end
+
+	yRot = tonumber(yRot) or 0
+	xRot = tonumber(xRot) or 0
+	local cframe = CFrame.new(position) * CFrame.Angles(math.rad(xRot), math.rad(yRot), 0)
+
+	local object = template:Clone()
+	object.Parent = workspace
+	if object:IsA("Model") and object.PrimaryPart then
+		object:SetPrimaryPartCFrame(cframe)
+	elseif object:IsA("BasePart") then
+		object.CFrame = cframe
+	end
+end)
