@@ -1,0 +1,262 @@
+-- Roblox Block Building System (LocalScript)
+-- Place this script in StarterPlayerScripts.
+-- Now avoids stacking on invisible plot base like "PlayersPlot".
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+
+local DEBUG = false
+local function debugPrint(...)
+	if DEBUG then print("[BuildSystem]", ...) end
+end
+
+local player = Players.LocalPlayer
+
+-- Get RemoteEvent/Function and templates
+local events = ReplicatedStorage:WaitForChild("Events")
+local placeBlockEvent = events:WaitForChild("PlaceBlockEvent")
+local getPlotInfo = events:WaitForChild("GetPlotInfo")
+local templatesFolder = ReplicatedStorage:WaitForChild("BuildingTemplates")
+
+local BLOCK_SIZE = 3
+local DEFAULT_FIRST_LAYER_Y = 2.3
+local MAX_BUILD_RADIUS = 15
+
+local preview -- current preview model
+local currentTool -- currently equipped Tool
+local plotMinCorner, plotSize, basePart
+
+local rotationY, rotationX = 0, 0
+
+--- Utility: Set preview model visuals
+local function setPreviewVisuals(obj)
+	if obj:IsA("BasePart") then
+		obj.Color = Color3.fromRGB(0, 255, 0)
+		obj.Transparency = 0.5
+		obj.CanCollide = false
+		obj.Anchored = true
+	end
+	for _, child in ipairs(obj:GetChildren()) do
+		setPreviewVisuals(child)
+	end
+end
+
+--- Utility: Clamp X/Z to plot bounds
+local function clampToPlot(x, z)
+	if not plotMinCorner or not plotSize then return x, z end
+	local maxCorner = plotMinCorner + plotSize
+	local min = plotMinCorner + Vector3.new(BLOCK_SIZE/2, 0, BLOCK_SIZE/2)
+	local max = maxCorner - Vector3.new(BLOCK_SIZE/2, 0, BLOCK_SIZE/2)
+	return math.clamp(x, min.X, max.X), math.clamp(z, min.Z, max.Z)
+end
+
+--- Utility: Surface Y for placement (raycast) [IGNORES INVISIBLE PLOT BASE!]
+local function getSurfaceY(x, z)
+	local rayOrigin = Vector3.new(x, 200, z)
+	local rayDirection = Vector3.new(0, -400, 0)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Blacklist
+	params.FilterDescendantsInstances = {preview}
+	local result = workspace:Raycast(rayOrigin, rayDirection, params)
+	if result and result.Instance then
+		debugPrint("Raycast hit:", result.Instance:GetFullName(), "at", result.Position)
+		-- If we hit plot base or invisible plot part, snap to first layer
+		local isPlotBase = false
+		if basePart and result.Instance == basePart then
+			isPlotBase = true
+		elseif result.Instance.Name == basePart.Parent.Name and result.Instance:IsDescendantOf(workspace:FindFirstChild("Slots") or workspace) then
+			isPlotBase = true
+		end
+		if isPlotBase then
+			return DEFAULT_FIRST_LAYER_Y
+		else
+			return result.Position.Y + BLOCK_SIZE/2
+		end
+	else
+		debugPrint("Raycast found no result, using default Y")
+		return DEFAULT_FIRST_LAYER_Y
+	end
+end
+
+--- Utility: Get preview CFrame at build position
+local function getPreviewCFrame(buildPos)
+	return CFrame.new(buildPos) * CFrame.Angles(math.rad(rotationX), math.rad(rotationY), 0)
+end
+
+--- Utility: Fetch plot info from server
+local function fetchPlotInfo()
+	local data = getPlotInfo:InvokeServer()
+	debugPrint("Fetched plot info", data)
+	if data then
+		plotMinCorner = data.minCorner
+		plotSize = data.size
+		local plotContainer = workspace:FindFirstChild("Slots")
+		local plotInstance = plotContainer and plotContainer:FindFirstChild(data.plotName)
+		basePart = plotInstance and plotInstance:FindFirstChild(data.basePartName)
+		if not basePart and plotInstance and plotInstance.Name == "Base" then
+			basePart = plotInstance
+		end
+		debugPrint("BasePart:", basePart)
+	else
+		plotMinCorner, plotSize, basePart = nil, nil, nil
+	end
+end
+
+--- Preview update per frame
+local function updatePreview()
+	if not preview or not plotMinCorner or not plotSize or not basePart then return end
+	local character = player.Character
+	if not character then return end
+	local root = character:FindFirstChild("HumanoidRootPart")
+	if not root then return end
+
+	local newPos = root.Position + root.CFrame.LookVector * 6
+	local rel = newPos - plotMinCorner
+	local snappedX = plotMinCorner.X + math.floor(rel.X / BLOCK_SIZE) * BLOCK_SIZE + BLOCK_SIZE/2
+	local snappedZ = plotMinCorner.Z + math.floor(rel.Z / BLOCK_SIZE) * BLOCK_SIZE + BLOCK_SIZE/2
+	local clampedX, clampedZ = clampToPlot(snappedX, snappedZ)
+	local snappedY = getSurfaceY(clampedX, clampedZ)
+	local buildPos = Vector3.new(clampedX, snappedY, clampedZ)
+	local dist = (buildPos - root.Position).Magnitude
+
+	for _, part in ipairs(preview:GetDescendants()) do
+		if part:IsA("BasePart") then
+			if dist > MAX_BUILD_RADIUS then
+				part.Transparency = 0.9
+				part.Color = Color3.fromRGB(255, 0, 0)
+			else
+				part.Transparency = 0.5
+				part.Color = Color3.fromRGB(0, 255, 0)
+			end
+		end
+	end
+
+	local previewCFrame = getPreviewCFrame(buildPos)
+	if preview:IsA("Model") and preview.PrimaryPart then
+		preview:SetPrimaryPartCFrame(previewCFrame)
+	elseif preview:IsA("BasePart") then
+		preview.CFrame = previewCFrame
+	end
+end
+
+local isRenderStepBound = false
+
+local function createPreview(toolName)
+	if preview then
+		preview:Destroy()
+		preview = nil
+	end
+	local template = templatesFolder:FindFirstChild(toolName)
+	if not template then
+		warn("No template named " .. toolName .. " in BuildingTemplates")
+		return
+	end
+	preview = template:Clone()
+	preview.Name = "PreviewObject"
+	setPreviewVisuals(preview)
+	if preview:IsA("Model") and not preview.PrimaryPart then
+		for _, part in ipairs(preview:GetDescendants()) do
+			if part:IsA("BasePart") then
+				preview.PrimaryPart = part
+				break
+			end
+		end
+	end
+	preview.Parent = workspace
+	rotationY, rotationX = 0, 0
+	debugPrint("Created preview for", toolName)
+	if isRenderStepBound then
+		RunService:UnbindFromRenderStep("BlockPreview")
+		isRenderStepBound = false
+	end
+	RunService:BindToRenderStep("BlockPreview", Enum.RenderPriority.Camera.Value + 1, updatePreview)
+	isRenderStepBound = true
+end
+
+local function removePreview()
+	if preview then
+		preview:Destroy()
+		preview = nil
+	end
+	if isRenderStepBound then
+		RunService:UnbindFromRenderStep("BlockPreview")
+		isRenderStepBound = false
+	end
+end
+
+--- Remove preview
+local function removePreview()
+	if preview then
+		preview:Destroy()
+		preview = nil
+	end
+	RunService:UnbindFromRenderStep("BlockPreview")
+end
+
+--- On tool equip
+local function onToolEquipped(tool)
+	currentTool = tool
+	debugPrint("Tool equipped:", tool.Name)
+	fetchPlotInfo()
+	if not plotMinCorner or not basePart then
+		warn("No plot or base part found for player!")
+		return
+	end
+	createPreview(tool.Name)
+	tool.Activated:Connect(function()
+		debugPrint("Tool activated")
+		if preview then
+			local character = player.Character
+			local root = character and character:FindFirstChild("HumanoidRootPart")
+			if root then
+				local pos
+				if preview:IsA("Model") and preview.PrimaryPart then
+					pos = preview.PrimaryPart.Position
+				elseif preview:IsA("BasePart") then
+					pos = preview.Position
+				end
+				if pos and (pos - root.Position).Magnitude <= MAX_BUILD_RADIUS then
+					placeBlockEvent:FireServer(tool.Name, pos, rotationY, rotationX)
+					debugPrint("Sent placement to server")
+				end
+			end
+		end
+	end)
+	tool.Unequipped:Connect(function()
+		debugPrint("Tool unequipped")
+		removePreview()
+	end)
+end
+
+--- Listen for tool equips
+local function connectCharacterTools(character)
+	for _, tool in ipairs(character:GetChildren()) do
+		if tool:IsA("Tool") then
+			tool.Equipped:Connect(function() onToolEquipped(tool) end)
+		end
+	end
+	character.ChildAdded:Connect(function(child)
+		if child:IsA("Tool") then
+			child.Equipped:Connect(function() onToolEquipped(child) end)
+		end
+	end)
+end
+
+player.CharacterAdded:Connect(function(character)
+	debugPrint("CharacterAdded:", character)
+	connectCharacterTools(character)
+end)
+if player.Character then connectCharacterTools(player.Character) end
+
+UserInputService.InputBegan:Connect(function(input, processed)
+	if processed or not preview then return end
+	if input.KeyCode == Enum.KeyCode.R then
+		rotationY = (rotationY + 90) % 360
+		debugPrint("Rotated Y:", rotationY)
+	elseif input.KeyCode == Enum.KeyCode.T then
+		rotationX = (rotationX + 90) % 360
+		debugPrint("Rotated X:", rotationX)
+	end
+end)
